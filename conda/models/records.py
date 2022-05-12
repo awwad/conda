@@ -259,7 +259,15 @@ class PackageRecord(DictSafeMixin, Entity):
     url = StringField(default=None, required=False, nullable=True, default_in_dump=False)
     sha256 = StringField(default=None, required=False, nullable=True, default_in_dump=False)
 
+    # <~> Can also try running signature verification here via lazy-loaded property.
     metadata_signature_status = EnumField(MetadataSignatureStatus, required=False)
+    signatures = dict()   # TODO: This presumably breaks auxlib enforcement of data structures!  Change to whatever appropriate auxlib.entity class.  <~>
+
+    # A way to preserve verifiable information from repodata before it has been
+    # manipulated by all the weird stuff in subdir_data.py, and a way to
+    # preserve simplicity of verification logic in conda... that unfortunately
+    # changes the signature format and so breaks all prior signatures.
+    # hash_of_signed_metadata_payload = StringField()
 
     @property
     def schannel(self):

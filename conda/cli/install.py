@@ -4,8 +4,10 @@
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 from logging import getLogger
+import json
 import os
 from os.path import abspath, basename, exists, isdir, isfile, join
+from time import perf_counter
 
 from . import common
 from .common import check_non_admin
@@ -13,6 +15,7 @@ from .. import CondaError
 from ..auxlib.ish import dals
 from ..base.constants import ROOT_ENV_NAME, DepsModifier, UpdateModifier, REPODATA_FN
 from ..base.context import context, locate_prefix_by_name
+from ..base.constants import INITIAL_TRUST_ROOT    # Where root.json is currently.
 from ..common.compat import scandir, text_type
 from ..common.constants import NULL
 from ..common.path import paths_equal, is_package_file
@@ -27,10 +30,28 @@ from ..exceptions import (CondaExitZero, CondaImportError, CondaOSError, CondaSy
                           SpecsConfigurationConflictError)
 from ..gateways.disk.create import mkdir_p
 from ..gateways.disk.delete import delete_trash, path_is_clean
+from ..gateways.connection.session import CondaSession  # For trust metadata fetching, at least during development
 from ..misc import clone_env, explicit, touch_nonadmin
 from ..models.match_spec import MatchSpec
+from ..models.enums import MetadataSignatureStatus
 from ..plan import revert_actions
 from ..resolve import ResolvePackageNotFound
+
+try:
+    import conda_content_trust
+    from conda_content_trust.common import (
+        SignatureError,
+        load_metadata_from_file as load_trust_metadata_from_file,
+        write_metadata_to_file as write_trust_metadata_to_file,
+    )
+    from conda_content_trust.authentication import (
+        verify_root as verify_trust_root,
+        verify_delegation as verify_trust_delegation,
+    )
+    from conda_content_trust.signing import wrap_as_signable
+except ImportError:
+    conda_content_trust = None
+
 
 log = getLogger(__name__)
 stderrlog = getLogger('conda.stderr')
@@ -313,6 +334,54 @@ def install(args, parser, command='install'):
                 if e.args and 'could not import' in e.args[0]:
                     raise CondaImportError(text_type(e))
                 raise e
+    # # Verify
+    # if context.extra_safety_checks:
+    #     if conda_content_trust is None:
+    #         log.warn("metadata signature verification requested, "
+    #                  "but `conda-content-trust` is not installed.")
+    #     elif not context.signing_metadata_url_base:
+    #         log.info("metadata signature verification requested, "
+    #                  "but no metadata URL base has been specified.")
+    #     else:
+    #         t_before_trust_refresh = perf_counter()
+    #         refresh_signing_metadata()  # -->  conda.trust.refresh_trust_metadata
+    #         t_after_trust_refresh = perf_counter()
+    #         # TODO: Downgrade from info to debug. <~>
+    #         log.info('Trust metadata refresh complete.  Total time consumed: ' + str(t_before_trust_refresh - t_after_trust_refresh))
+
+    # Determine which PackageRecords are involved in this transaction.
+    # **Assuming that these map to P
+
+    ENV_PREFIX = '/home/s/conda/devenv/Linux/envs/devenv-3.8-c'    # debug
+
+    # names_of_pkgs = [prec.name for prec in unlink_link_transaction.prefix_setups[ENV_PREFIX].link_precs]
+
+    # Testing
+
+    # TODO (AV): Pull contents of this conditional into a separate module/function
+    if context.extra_safety_checks:
+        if conda_content_trust is None:
+            log.warn("metadata signature verification requested, "
+                     "but `conda-content-trust` is not installed.")
+        elif not context.signing_metadata_url_base:
+            log.info("metadata signature verification requested, "
+                     "but no metadata URL base has been specified.")
+        else:
+            t_before_trust_refresh = perf_counter()
+            _refresh_signing_metadata()
+            t_after_trust_refresh = perf_counter()
+            # TODO: Downgrade from info to debug. <~>
+            log.info('Trust metadata refresh complete.  Total time consumed: ' + str(round(t_after_trust_refresh - t_before_trust_refresh, 3)) + 's.')
+
+    for prec in unlink_link_transaction.prefix_setups[ENV_PREFIX].link_precs:
+        if signatures in prec and prec['signatures']:
+            print(prec['signatures'])
+            signable = wrap_as_signable(info)
+
+        for signature_entry in prec['signatures']
+
+        prec['metadata_signature_status'] = MetadataSignatureStatus.error#verified
+
     handle_txn(unlink_link_transaction, prefix, args, newenv)
 
 
@@ -354,3 +423,144 @@ def handle_txn(unlink_link_transaction, prefix, args, newenv, remove_op=False):
     if context.json:
         actions = unlink_link_transaction._make_legacy_action_groups()[0]
         common.stdout_json_success(prefix=prefix, actions=actions)
+
+
+
+# TODO: These refresh functions should go into their own module
+#       (or at least not be in this one).
+
+def _refresh_signing_metadata():
+    if not isdir(context.av_data_dir):
+        log.info("creating directory for artifact verification metadata")
+        makedirs(context.av_data_dir)
+    root_trust_metadata = _refresh_signing_root()
+    key_mgr_trust_metadata = _refresh_signing_keymgr(root_trust_metadata)
+
+def _refresh_signing_root():
+    # TODO (AV): formalize paths for `*.root.json` and `key_mgr.json` on server-side
+    trusted_root = INITIAL_TRUST_ROOT
+
+    # Load current trust root metadata from filesystem
+    latest_root_id, latest_root_path = -1, None
+    for cur_path in iglob(join(context.av_data_dir, "[0-9]*.root.json")):
+        # TODO (AV): better pattern matching in above glob
+        cur_id = basename(cur_path).split(".")[0]
+        if cur_id.isdigit():
+            cur_id = int(cur_id)
+            if cur_id > latest_root_id:
+                latest_root_id, latest_root_path = cur_id, cur_path
+
+    if latest_root_path is None:
+        log.debug(f"No root metadata in {context.av_data_dir}. "
+                  "Using built-in root metadata.")
+    else:
+        log.info(f"Loading root metadata from {latest_root_path}.")
+        trusted_root = load_trust_metadata_from_file(latest_root_path)
+
+    # Refresh trust root metadata
+    attempt_refresh = True
+    while attempt_refresh:
+        # TODO (AV): caching mechanism to reduce number of refresh requests
+        next_version_of_root = 1 + trusted_root['signed']['version']
+        next_root_fname = str(next_version_of_root) + '.root.json'
+        next_root_path = join(context.av_data_dir, next_root_fname)
+        try:
+            update_url = f"{channel.base_url}/{next_root_fname}"    # Find a sensible source for
+            log.info(f"Fetching updated trust root if it exists: {update_url}")
+
+            # TODO (AV): support fetching root data with credentials
+            untrusted_root = fetch_channel_signing_data(
+                    context.signing_metadata_url_base,
+                    next_root_fname)
+
+            verify_trust_root(trusted_root, untrusted_root)
+
+            # New trust root metadata checks out
+            trusted_root = untrusted_root
+            write_trust_metadata_to_file(trusted_root, next_root_path)
+
+        # TODO (AV): more error handling improvements (?)
+        except (HTTPError,) as err:
+            # HTTP 404 implies no updated root.json is available, which is
+            # not really an "error" and does not need to be logged.
+            if err.response.status_code not in (404,):
+                log.error(err)
+            attempt_refresh = False
+        except Exception as err:
+            log.error(err)
+            attempt_refresh = False
+
+def _refresh_signing_keymgr(trusted_root):
+    # Refresh key manager metadata
+    key_mgr_filename = "key_mgr.json"  # TODO (AV): make this a constant or config value
+    key_mgr = None
+
+    key_mgr_path = join(context.av_data_dir, key_mgr_filename)
+    try:
+        untrusted_key_mgr = fetch_channel_signing_data(
+                context.signing_metadata_url_base,
+                key_mgr_filename)
+        verify_trust_delegation("key_mgr", untrusted_key_mgr, trusted_root)
+        key_mgr = untrusted_key_mgr
+        write_trust_metadata_to_file(key_mgr, key_mgr_path)
+    except (ConnectionError, HTTPError,) as err:
+        log.warn(f"Could not retrieve {channel.base_url}/{key_mgr_filename}: {err}")
+    # TODO (AV): much more sensible error handling here
+    except Exception as err:
+        log.error(err)
+
+    # If key_mgr is unavailable from server, fall back to copy on disk
+    if key_mgr is None and exists(key_mgr_path):
+        key_mgr = load_trust_metadata_from_file(key_mgr_path)
+
+
+
+# TODO (AV): move these functions to a more appropriate place
+def fetch_channel_signing_data(signing_data_url, filename, etag=None, mod_stamp=None):
+    if not context.ssl_verify:
+        warnings.simplefilter('ignore', InsecureRequestWarning)
+
+    session = CondaSession()
+
+    headers = {}
+    if etag:
+        headers["If-None-Match"] = etag
+    if mod_stamp:
+        headers["If-Modified-Since"] = mod_stamp
+
+    headers['Accept-Encoding'] = 'gzip, deflate, compress, identity'
+    headers['Content-Type'] = 'application/json'
+
+    try:
+        timeout = context.remote_connect_timeout_secs, context.remote_read_timeout_secs
+        file_url = join_url(signing_data_url, filename)
+
+        # The `auth` arugment below looks a bit weird, but passing `None` seems
+        # insufficient for suppressing modifying the URL to add an Anaconda
+        # server token; for whatever reason, we must pass an actual callable in
+        # order to suppress the HTTP auth behavior configured in the session.
+        #
+        # TODO (AV): Figure how to handle authn for obtaining trust metadata,
+        # independently of the authn used to access package repositories.
+        resp = session.get(file_url, headers=headers, proxies=session.proxies,
+                           auth=lambda r: r, timeout=timeout)
+
+        resp.raise_for_status()
+    except:
+        # TODO (AV): more sensible error handling
+        raise
+
+    # In certain cases (e.g., using `-c` access anaconda.org channels), the
+    # `CondaSession.get()` retry logic combined with the remote server's
+    # behavior can result in non-JSON content being returned.  Parse returned
+    # content here (rather than directly in the return statement) so callers of
+    # this function only have to worry about a ValueError being raised.
+    try:
+        str_data = json.loads(resp.content)
+    except json.decoder.JSONDecodeError as err:  # noqa
+        raise ValueError(f"Invalid JSON returned from {signing_data_url}/{filename}") from err
+
+    # TODO (AV): additional loading and error handling improvements?
+
+    return str_data
+
